@@ -1,63 +1,96 @@
-import requests
-import imagehash
-from PIL import Image
-from io import BytesIO
+import os
+import glob
+import time
+from utils import load_image, calculate_phash, get_hamming_distance
 
-def load_image_from_url(url):
-    """
-    Downloads an image from a URL and converts it to a PIL Image object.
-    Returns None if the download fails.
-    """
-    try:
-        # Use a timeout to prevent hanging on bad URLs
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-        return Image.open(BytesIO(response.content))
-    except Exception as e:
-        print(f"[ERROR] Failed to load image: {url}")
-        return None
+# --- Configuration Settings ---
+# Path to the reference image (The "Training Data" to check against)
+TARGET_IMAGE_PATH = "C:/Users/ICYICO/Desktop/fast-dataset-deduplication/image_6453b0.png"
 
-def get_hamming_distance(img1, img2):
+# Directory containing the dataset to scan
+SEARCH_DIRECTORY = "C:/Users/ICYICO/Desktop/fast-dataset-deduplication"
+
+# Hamming Distance Threshold (Distance <= 5 implies potential memorization)
+SIMILARITY_THRESHOLD = 5
+
+def run_batch_scan():
     """
-    Computes the Hamming Distance between two images using Perceptual Hashing (pHash).
+    Executes the batch scanning process.
     """
-    hash1 = imagehash.phash(img1)
-    hash2 = imagehash.phash(img2)
-    return hash1 - hash2
+    start_time = time.time()
+    
+    print("==========================================")
+    print("   DIFFUSION MEMORIZATION DETECTOR CLI    ")
+    print("==========================================")
+    print(f"[INFO] Target Image:   {os.path.basename(TARGET_IMAGE_PATH)}")
+    print(f"[INFO] Search Dir:     {SEARCH_DIRECTORY}")
+    print(f"[INFO] Threshold:      {SIMILARITY_THRESHOLD}")
+    print("-" * 42)
+
+    # 1. Load and Hash the Reference Image
+    print("[INIT] Loading reference target...")
+    target_img = load_image(TARGET_IMAGE_PATH)
+    
+    if target_img is None:
+        print(f"[FATAL] Could not load target image at: {TARGET_IMAGE_PATH}")
+        print("[FATAL] Aborting execution.")
+        return
+
+    target_hash = calculate_phash(target_img)
+    print(f"[SUCCESS] Target Hash Computed: {target_hash}")
+    print("-" * 42)
+
+    # 2. Gather all image files in the directory
+    # Supports .png, .jpg, and .jpeg extensions
+    image_extensions = ["*.png", "*.jpg", "*.jpeg"]
+    image_files = []
+    for ext in image_extensions:
+        image_files.extend(glob.glob(os.path.join(SEARCH_DIRECTORY, ext)))
+
+    total_files = len(image_files)
+    print(f"[INFO] Found {total_files} images in directory. Starting scan...")
+    print("-" * 42)
+
+    # 3. Iterate and Compare
+    duplicates_count = 0
+    processed_count = 0
+
+    for file_path in image_files:
+        # Skip the target image itself if it exists in the same folder
+        if os.path.abspath(file_path) == os.path.abspath(TARGET_IMAGE_PATH):
+            continue
+
+        filename = os.path.basename(file_path)
+        processed_count += 1
+
+        # Load candidate image
+        current_img = load_image(file_path)
+        if current_img is None:
+            print(f"[WARN] Skipping unreadable file: {filename}")
+            continue
+
+        # Compute Hash and Distance
+        current_hash = calculate_phash(current_img)
+        distance = get_hamming_distance(target_hash, current_hash)
+
+        # Evaluation
+        if distance <= SIMILARITY_THRESHOLD:
+            print(f"[ALERT] DUPLICATE DETECTED | File: {filename:<20} | Distance: {distance}")
+            duplicates_count += 1
+        else:
+            # Optional: Comment this out if scanning large datasets to reduce noise
+            # print(f"[PASS]  Distinct Image     | File: {filename:<20} | Distance: {distance}")
+            pass
+
+    # 4. Final Report
+    elapsed_time = time.time() - start_time
+    print("-" * 42)
+    print("SCAN COMPLETION REPORT")
+    print("-" * 42)
+    print(f"Total Processed:    {processed_count}")
+    print(f"Duplicates Found:   {duplicates_count}")
+    print(f"Time Elapsed:       {elapsed_time:.2f} seconds")
+    print("==========================================")
 
 if __name__ == "__main__":
-    print("--- Starting Diffusion Memorization Detection ---\n")
-
-    # 1. Define the Target Image (The 'Original' from training data)
-    target_url = "http://images.cocodataset.org/val2017/000000039769.jpg"
-    
-    # 2. Define Test Images (Simulating generated output)
-    test_urls = [
-        "http://images.cocodataset.org/val2017/000000039769.jpg",  # Exact match
-        "https://upload.wikimedia.org/wikipedia/commons/thumb/3/3a/Cat03.jpg/1200px-Cat03.jpg", # Different image
-        "http://images.cocodataset.org/val2017/000000039769.jpg"   # Exact match
-    ]
-
-    # Load target
-    target_img = load_image_from_url(target_url)
-
-    if target_img:
-        print(f"Target image loaded. Processing {len(test_urls)} test samples...\n")
-
-        for index, url in enumerate(test_urls):
-            test_img = load_image_from_url(url)
-            
-            if test_img:
-                distance = get_hamming_distance(target_img, test_img)
-                
-                # output format: [ID] Distance | Status
-                status = "SAFE"
-                if distance == 0:
-                    status = "DUPLICATE DETECTED"
-                elif distance < 5:
-                    status = "POTENTIAL MEMORIZATION"
-                
-                print(f"[Sample {index+1}] Distance: {distance} | {status}")
-            
-    else:
-        print("[FATAL] Could not load target image.")
+    run_batch_scan()
