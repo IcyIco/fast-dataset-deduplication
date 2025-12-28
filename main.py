@@ -1,95 +1,125 @@
 import os
 import glob
-import time
-from utils import load_image, calculate_phash, get_hamming_distance
+import pickle
+import faiss
+import numpy as np
+from utils import (
+    load_image, calculate_phash, get_geometric_variations, 
+    calculate_ssim_score, hashes_to_vectors
+)
 
-# --- Configuration Settings ---
-# Path to the reference image (The "Training Data" to check against)
+# --- Configuration ---
 TARGET_IMAGE_PATH = "C:/Users/ICYICO/Desktop/fast-dataset-deduplication/image_6453b0.png"
-
-# Directory containing the dataset to scan
 SEARCH_DIRECTORY = "C:/Users/ICYICO/Desktop/fast-dataset-deduplication"
 
-# Hamming Distance Threshold (Distance <= 5 implies potential memorization)
-SIMILARITY_THRESHOLD = 5
+INDEX_FILE = "dataset.index"
+MAPPING_FILE = "filenames.pkl"
 
-def run_batch_scan():
-    """
-    Executes the batch scanning process.
-    """
-    start_time = time.time()
-    
-    print("==========================================")
-    print("   DIFFUSION MEMORIZATION DETECTOR CLI    ")
-    print("==========================================")
-    print(f"[INFO] Target Image:   {os.path.basename(TARGET_IMAGE_PATH)}")
-    print(f"[INFO] Search Dir:     {SEARCH_DIRECTORY}")
-    print(f"[INFO] Threshold:      {SIMILARITY_THRESHOLD}")
-    print("-" * 42)
+# Thresholds
+HAMMING_THRESHOLD = 8
+SSIM_THRESHOLD = 0.45
 
-    # 1. Load and Hash the Reference Image
-    print("[INIT] Loading reference target...")
-    target_img = load_image(TARGET_IMAGE_PATH)
-    
-    if target_img is None:
-        print(f"[FATAL] Could not load target image at: {TARGET_IMAGE_PATH}")
-        print("[FATAL] Aborting execution.")
+def build_index_if_needed():
+    """
+    Builds the FAISS index if it does not already exist.
+    """
+    if os.path.exists(INDEX_FILE) and os.path.exists(MAPPING_FILE):
         return
 
-    target_hash = calculate_phash(target_img)
-    print(f"[SUCCESS] Target Hash Computed: {target_hash}")
-    print("-" * 42)
+    print("[INFO] Building Search Index...")
+    image_files = glob.glob(os.path.join(SEARCH_DIRECTORY, "*.png")) + \
+                  glob.glob(os.path.join(SEARCH_DIRECTORY, "*.jpg"))
+    
+    hash_list = []
+    valid_files = []
+    
+    for i, fpath in enumerate(image_files):
+        img = load_image(fpath)
+        if img:
+            hash_list.append(calculate_phash(img))
+            valid_files.append(fpath)
+        if i % 100 == 0: 
+            print(f"      Processed {i} images...", end="\r")
+            
+    vectors = hashes_to_vectors(hash_list)
+    
+    # Initialize Binary Flat Index (64-bit)
+    index = faiss.IndexBinaryFlat(64)
+    index.add(vectors)
+    
+    faiss.write_index_binary(index, INDEX_FILE)
+    with open(MAPPING_FILE, 'wb') as f:
+        pickle.dump(valid_files, f)
+    print(f"\n[INFO] Index built with {index.ntotal} items.")
 
-    # 2. Gather all image files in the directory
-    # Supports .png, .jpg, and .jpeg extensions
-    image_extensions = ["*.png", "*.jpg", "*.jpeg"]
-    image_files = []
-    for ext in image_extensions:
-        image_files.extend(glob.glob(os.path.join(SEARCH_DIRECTORY, ext)))
+def run_batch_scan():
+    print("==========================================")
+    print("   DIFFUSION MEMORIZATION DETECTOR        ")
+    print("==========================================")
+    
+    # 1. Check Index
+    build_index_if_needed()
+    
+    # 2. Load Index
+    try:
+        index = faiss.read_index_binary(INDEX_FILE)
+        with open(MAPPING_FILE, 'rb') as f:
+            filenames = pickle.load(f)
+    except Exception as e:
+        print(f"[ERROR] Failed to load index: {e}")
+        return
 
-    total_files = len(image_files)
-    print(f"[INFO] Found {total_files} images in directory. Starting scan...")
-    print("-" * 42)
+    # 3. Process Target
+    target_img = load_image(TARGET_IMAGE_PATH)
+    if not target_img: 
+        print(f"[ERROR] Could not load target: {TARGET_IMAGE_PATH}")
+        return
+    
+    # Generate geometric variants
+    target_hashes = get_geometric_variations(target_img)
+    query_vectors = hashes_to_vectors(target_hashes)
+    
+    print(f"[INFO] Scanning against target: {os.path.basename(TARGET_IMAGE_PATH)}")
+    
+    # 4. Search Index
+    # Query all variations; find top 10 matches for each
+    D, I = index.search(query_vectors, k=10)
+    
+    found_candidates = set()
+    
+    print("-" * 65)
+    print(f"{'FILE':<35} | {'DIST':<5} | {'SSIM':<6} | {'RESULT'}")
+    print("-" * 65)
 
-    # 3. Iterate and Compare
-    duplicates_count = 0
-    processed_count = 0
+    # 5. Process Results
+    for variant_idx, (distances, indices) in enumerate(zip(D, I)):
+        for dist, idx in zip(distances, indices):
+            if idx == -1: continue
+            
+            candidate_file = filenames[idx]
+            
+            if os.path.abspath(candidate_file) == os.path.abspath(TARGET_IMAGE_PATH):
+                continue
+            
+            if candidate_file in found_candidates:
+                continue
 
-    for file_path in image_files:
-        # Skip the target image itself if it exists in the same folder
-        if os.path.abspath(file_path) == os.path.abspath(TARGET_IMAGE_PATH):
-            continue
+            if dist <= HAMMING_THRESHOLD:
+                # SSIM Check
+                candidate_img = load_image(candidate_file)
+                ssim_val = calculate_ssim_score(target_img, candidate_img)
+                
+                status = "PASS"
+                if ssim_val >= SSIM_THRESHOLD:
+                    status = "MEMORIZED"
+                    
+                print(f"{os.path.basename(candidate_file):<35} | {dist:<5} | {ssim_val:.2f}   | {status}")
+                
+                if status == "MEMORIZED":
+                    found_candidates.add(candidate_file)
 
-        filename = os.path.basename(file_path)
-        processed_count += 1
-
-        # Load candidate image
-        current_img = load_image(file_path)
-        if current_img is None:
-            print(f"[WARN] Skipping unreadable file: {filename}")
-            continue
-
-        # Compute Hash and Distance
-        current_hash = calculate_phash(current_img)
-        distance = get_hamming_distance(target_hash, current_hash)
-
-        # Evaluation
-        if distance <= SIMILARITY_THRESHOLD:
-            print(f"[ALERT] DUPLICATE DETECTED | File: {filename:<20} | Distance: {distance}")
-            duplicates_count += 1
-        else:
-            # Optional: Comment this out if scanning large datasets to reduce noise
-            # print(f"[PASS]  Distinct Image     | File: {filename:<20} | Distance: {distance}")
-            pass
-
-    # 4. Final Report
-    elapsed_time = time.time() - start_time
-    print("-" * 42)
-    print("SCAN COMPLETION REPORT")
-    print("-" * 42)
-    print(f"Total Processed:    {processed_count}")
-    print(f"Duplicates Found:   {duplicates_count}")
-    print(f"Time Elapsed:       {elapsed_time:.2f} seconds")
+    print("-" * 65)
+    print(f"[REPORT] Total Verified Duplicates: {len(found_candidates)}")
     print("==========================================")
 
 if __name__ == "__main__":

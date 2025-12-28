@@ -1,3 +1,7 @@
 ImageHash
 Pillow
 requests
+numpy
+scikit-image
+faiss-cpu
+streamlit
